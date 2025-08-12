@@ -1,0 +1,323 @@
+---
+title: "Untitled"
+output: html_document
+---
+```{r}
+library(limma)
+library(tibble)
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(readr)
+library(readxl)
+library(writexl)
+```
+
+# Normalization
+```{r}
+normalize_signed_weight <- function(w) {
+  if (all(w == 0) || max(abs(w)) == 0) return(rep(0, length(w)))
+  return(w / max(abs(w)))
+}
+
+normalize_network_by_tf <- function(df) {
+  df %>%
+    group_by(from) %>%
+    mutate(scaled_weight = normalize_signed_weight(signed_weight)) %>%
+    ungroup()
+}
+```
+
+
+```{r}
+perturb_df <- read.delim("/Users/jihungu/Desktop/Thesis/LASSO/Perturbations.tsv", header = FALSE, sep = "\t")
+perturb_genes <- unique(perturb_df$V1)
+```
+
+# Network
+```{r}
+causal_network <- read_excel("/Users/jihungu/Desktop/Thesis/RNAseq-perturbation-CD4-pipeline-master/causal_network.xlsx")
+causal_network_25 <- causal_network %>%
+  dplyr::filter(abs(estimate) >= 0.025)
+causal_network_25 <- causal_network_25 %>%
+  dplyr::rename(from = row, to = col, signed_weight = estimate)
+
+mashr <-read_excel("/Users/jihungu/Desktop/Reference/LLCB/Supplementary/mashr.xlsx")
+mashr <- mashr %>%
+  dplyr::filter(LFSR < 0.005)
+mashr <- mashr %>%
+  dplyr::rename(from = row, to = col, signed_weight = estimate)
+```
+
+```{r}
+llcb_scaled <- normalize_network_by_tf(causal_network_25)
+mashr_scaled <- normalize_network_by_tf(mashr)
+```
+
+
+```{r}
+viper_network = llcb_scaled %>%
+  dplyr::bind_rows(mashr_scaled)
+```
+
+
+
+```{r}
+library(viper)
+
+make_regulon_from_llcb <- function(network_df, tf_filter, threshold = 0.025) {
+  network_df <- network_df[abs(network_df$scaled_weight) >= threshold, ]
+  
+  network_df <- network_df[network_df$from %in% tf_filter, ]
+  
+  tf_list <- split(network_df, network_df$from)
+  
+  regulon <- lapply(tf_list, function(df) {
+    df <- as.data.frame(df)
+    tfmode <- setNames(sign(df$scaled_weight), df$to)
+    likelihood <- setNames(abs(df$scaled_weight), df$to)
+    list(tfmode = tfmode, likelihood = likelihood)
+  })
+  
+  return(regulon)
+}
+
+regulon <- make_regulon_from_llcb(viper_network, tf_filter = perturb_genes)
+```
+
+# ATL
+```{r}
+annot <- annot %>%
+  mutate(GENE_SYMBOL = ifelse(GENE_SYMBOL == "MLL", "KMT2A", GENE_SYMBOL))
+exprs_viper <- norm_exprs_data
+
+exprs_viper <- as.data.frame(exprs_viper)
+exprs_viper <- exprs_viper %>% rownames_to_column(var = "ID")
+exprs_viper$ID <- as.character(exprs_viper$ID)
+
+annot$ID <- as.character(annot$ID)
+exprs_viper <- left_join(exprs_viper, annot[, c("ID", "GENE_SYMBOL")], by = "ID")
+exprs_viper <- dplyr::select(exprs_viper, GENE_SYMBOL, everything())
+```
+
+# AC HAM/TSP
+```{r}
+annot <- annot %>%
+  mutate(SYMBOL = ifelse(SYMBOL == "MLL", "KMT2A", SYMBOL))
+exprs_viper <- norm_exprs_data
+
+exprs_viper <- as.data.frame(exprs_viper)
+exprs_viper <- exprs_viper %>% rownames_to_column(var = "ID")
+exprs_viper$ID <- as.character(exprs_viper$ID)
+
+annot$ID <- as.character(annot$ID)
+exprs_viper <- left_join(exprs_viper, annot[, c("ID", "SYMBOL")], by = "ID")
+exprs_viper <- dplyr::select(exprs_viper, SYMBOL, everything())
+```
+
+```{r}
+exprs_viper <- dplyr::select(exprs_viper, -ID)
+```
+
+# ATL
+```{r}
+exprs_viper <- exprs_viper %>%
+  group_by(GENE_SYMBOL) %>%
+  slice_max(order_by = rowMeans(across(where(is.numeric))), n = 1, with_ties = FALSE) %>%
+  ungroup()
+```
+
+# AC
+```{r}
+exprs_viper <- exprs_viper %>%
+  group_by(SYMBOL) %>%
+  slice_max(order_by = rowMeans(across(where(is.numeric))), n = 1, with_ties = FALSE) %>%
+  ungroup()
+```
+
+
+```{r}
+exprs_viper <- exprs_viper %>%
+  tibble::column_to_rownames(var = "GENE_SYMBOL")
+```
+
+```{r}
+viper_result <- viper(exprs_viper, regulon, method = "scale")
+```
+
+```{r}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(viper_result, design)
+
+contrast <- makeContrasts(ATLvsNI = ATL - NI, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+top_table <- topTable(fit2, number = Inf)
+head(top_table)
+
+top_table <- top_table %>%
+  rownames_to_column(var = "TF")
+```
+
+```{r}
+master_regulators <- top_table[top_table$adj.P.Val < 0.05 & abs(top_table$logFC) > 1, ]
+head(master_regulators)
+```
+
+
+```{r}
+library(pheatmap)
+
+sig_tfs <- top_table[top_table$adj.P.Val < 0.05 & abs(top_table$logFC) > 1, ]
+top_tfs <- rownames(sig_tfs)[1:25]
+
+annotation_col <- data.frame(Group = group)
+rownames(annotation_col) <- colnames(viper_result)
+
+pheatmap(viper_result[top_tfs, ],
+         annotation_col = annotation_col,
+         scale = "row", 
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "euclidean",
+         fontsize_row = 8)
+```
+
+# GSEA (TF-level)
+```{r}
+  enrich_result <- clusterProfiler::enrichGO(
+    gene         = perturb_genes,
+    OrgDb        = org.Hs.eg.db,
+    keyType      = "SYMBOL",
+    ont          = "BP",   # biological process
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05
+  )
+top50_pathways <- enrich_result@result %>%
+  dplyr::arrange(p.adjust) %>%   
+  dplyr::slice(1:50)             
+```
+
+
+```{r}
+tf_ranks <- top_table$logFC
+names(tf_ranks) <- rownames(top_table)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+tf_entrez <- bitr(names(tf_ranks), 
+                  fromType = "SYMBOL", 
+                  toType = "ENTREZID", 
+                  OrgDb = org.Hs.eg.db)
+
+tf_ranks_entrez <- tf_ranks[tf_entrez$SYMBOL]
+names(tf_ranks_entrez) <- tf_entrez$ENTREZID
+tf_ranks_entrez <- sort(tf_ranks_entrez, decreasing = TRUE)
+
+
+gsea_kegg <- gseKEGG(geneList     = tf_ranks_entrez,
+                     organism     = 'hsa',
+                     minGSSize    = 10,
+                     maxGSSize    = 500,
+                     pvalueCutoff = 0.05,
+                     verbose      = FALSE)
+```
+
+# ORA on target genes
+```{r}
+kmt2a_targets <- names(regulon$STAT1$tfmode)
+
+# GO ORA
+ego <- enrichGO(gene = kmt2a_targets,
+                OrgDb = org.Hs.eg.db,
+                keyType = "SYMBOL",
+                ont = "BP",
+                pvalueCutoff = 0.05)
+```
+
+
+```{r}
+# KEGG ORA
+target_entrez <- bitr(kmt2a_targets,
+                      fromType = "SYMBOL",
+                      toType = "ENTREZID",
+                      OrgDb = org.Hs.eg.db)
+
+ekegg <- enrichKEGG(gene = target_entrez$ENTREZID,
+                    organism = 'hsa',
+                    pvalueCutoff = 0.05)
+head(ekegg@result[, c("ID", "Description", "p.adjust")])
+dotplot(ekegg, showCategory = 70)
+```
+
+```{r}
+pathway_name <- "NF-kappa B signaling pathway"
+
+genes_in_pathway <- ekegg@result %>%
+  filter(Description == pathway_name) %>%
+  pull(geneID) %>%
+  strsplit(split = "/") %>%
+  unlist()
+
+gene_symbols <- bitr(genes_in_pathway,
+                     fromType = "ENTREZID",
+                     toType = "SYMBOL",
+                     OrgDb = org.Hs.eg.db)
+
+print(gene_symbols)
+```
+
+### ACUTE CHRONIC
+```{r}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(viper_result, design)
+
+contrast <- makeContrasts(AcutevsControl = Acute - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+top_table <- topTable(fit2, number = Inf)
+head(top_table)
+```
+
+```{r}
+master_regulators <- top_table[top_table$adj.P.Val < 0.05 & abs(top_table$logFC) > 1, ]
+head(master_regulators)
+```
+
+```{r}
+status <- c("Acute", "Chronic", "Lymphoma", "Smoldering", "Unknown")
+counts <- c(16, 6, 1, 0, 1)
+
+library(ggplot2)
+
+df <- data.frame(
+  Subtype = factor(status, levels = status),
+  Count = counts
+)
+
+# barplot
+ggplot(df, aes(x = Subtype, y = Count)) +
+  geom_bar(stat = "identity", fill = "grey") +
+  labs(title = "HTLV-1 Clinical Subtypes",
+       x = "Subtype",
+       y = "Number of Patients") +
+  theme_minimal()
+
+```
+
+```{r}
+barplot(counts,
+        names.arg = status,
+        col = "skyblue",
+        main = "HTLV-1 Clinical Subtypes",
+        ylab = "Number of Patients",
+        xlab = "Subtype",
+        ylim = c(0, max(counts) + 2))
+```
+

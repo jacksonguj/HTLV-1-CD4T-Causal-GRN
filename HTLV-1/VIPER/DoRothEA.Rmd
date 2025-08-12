@@ -1,0 +1,55 @@
+---
+title: "DoRothEA"
+output: html_document
+---
+
+```{r}
+library(dorothea)
+library(viper)
+
+data(dorothea_hs, package = "dorothea")
+regulon_dorothea <- dorothea_hs %>% 
+  dplyr::filter(confidence %in% c("A", "B"))
+
+regulon_do <- lapply(unique(regulon_dorothea$tf), function(tf) {
+  targets <- regulon_dorothea %>% filter(tf == !!tf)
+  tfmode <- setNames(ifelse(is.na(targets$mor), 1, targets$mor), targets$target)
+  likelihood <- setNames(rep(1, nrow(targets)), targets$target)
+  list(tfmode = tfmode, likelihood = likelihood)
+})
+names(regulon_do) <- unique(regulon_dorothea$tf)
+```
+
+```{r}
+viper_result_do <- viper(exprs_viper, regulon_do, method = "scale")
+```
+
+```{r}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(viper_result_do, design)
+
+contrast <- makeContrasts(ATLvsNI = ATL - NI, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+top_table_do <- topTable(fit2, number = Inf)
+head(top_table_do)
+top_table_do <- top_table_do %>%
+  rownames_to_column(var = "TF")
+```
+
+```{r}
+master_regulators_do <- top_table_do[top_table_do$adj.P.Val < 0.05 & abs(top_table_do$logFC) > 1, ]
+head(master_regulators_do)
+```
+
+```{r}
+do_tfs <- rownames(master_regulators_do)
+llcb_tfs <- rownames(master_regulators)
+ 
+intersect_tfs <- intersect(do_tfs, llcb_tfs)
+intersect_tfs
+```
+

@@ -1,0 +1,140 @@
+---
+title: "CollecTRI"
+output: html_document
+---
+
+```{r}
+library(decoupleR)
+
+# CollecTRI regulon
+regulon_collectri <- get_collectri(organism = 'human', split_complexes = FALSE)
+
+regulon_collectri$source <- as.character(regulon_collectri$source)
+regulon_collectri$target <- as.character(regulon_collectri$target)
+```
+
+```{r}
+regulon_col <- lapply(unique(regulon_collectri$source), function(tf) {
+  targets <- regulon_collectri %>% filter(source == tf)
+  
+  tfmode <- setNames(ifelse(is.na(targets$mor), 1, targets$mor), targets$target)
+  
+  likelihood <- setNames(rep(1, length(tfmode)), names(tfmode))
+  
+  list(tfmode = tfmode, likelihood = likelihood)
+})
+
+names(regulon_col) <- unique(regulon_collectri$source)
+```
+
+```{r}
+viper_result_collectri <- viper(exprs_viper, regulon_col, method = "scale")
+```
+```{r}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(viper_result_collectri, design)
+
+contrast <- makeContrasts(ATLvsNI = ATL - NI, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+top_table_collectri <- topTable(fit2, number = Inf)
+head(top_table_collectri)
+top_table_collectri <- top_table_collectri %>%
+  rownames_to_column(var = "TF")
+```
+
+```{r}
+master_regulators_collectri <- top_table_collectri[top_table_collectri$adj.P.Val < 0.05 & abs(top_table_collectri$logFC) > 1, ]
+head(master_regulators_collectri)
+```
+
+```{r}
+col_tfs <- master_regulators_collectri$TF
+llcb_tfs <- master_regulators$TF
+do_tfs <- master_regulators_do$TF
+ 
+intersect_tfs <- intersect(col_tfs, do_tfs)
+intersect_tfs
+```
+
+
+```{r}
+tf_ranks <- top_table_collectri$logFC
+names(tf_ranks) <- top_table_collectri$TF
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+tf_entrez <- bitr(names(tf_ranks), 
+                  fromType = "SYMBOL", 
+                  toType = "ENTREZID", 
+                  OrgDb = org.Hs.eg.db)
+
+tf_ranks_entrez <- tf_ranks[tf_entrez$SYMBOL]
+names(tf_ranks_entrez) <- tf_entrez$ENTREZID
+tf_ranks_entrez <- sort(tf_ranks_entrez, decreasing = TRUE)
+
+
+gsea_kegg <- gseKEGG(geneList     = tf_ranks_entrez,
+                     organism     = 'hsa',
+                     minGSSize    = 10,
+                     maxGSSize    = 500,
+                     pvalueCutoff = 0.05,
+                     verbose      = FALSE)
+
+dotplot(gsea_kegg, showCategory = 25)
+```
+
+```{r}
+pathway_name <- "Human T-cell leukemia virus 1 infection"
+
+genes_in_pathway <- gsea_kegg@result %>%
+  filter(Description == pathway_name) %>%
+  pull(core_enrichment) %>%
+  strsplit(split = "/") %>%
+  unlist()
+gene_symbols <- bitr(genes_in_pathway,
+                     fromType = "ENTREZID",
+                     toType = "SYMBOL",
+                     OrgDb = org.Hs.eg.db)
+
+print(gene_symbols)
+```
+
+```{r}
+library(pheatmap)
+
+sig_tfs <- top_table_collectri[top_table_collectri$adj.P.Val < 0.05 & abs(top_table_collectri$logFC) > 1, ]
+top_tfs <- rownames(sig_tfs)[1:25]
+
+annotation_col <- data.frame(Group = group)
+rownames(annotation_col) <- colnames(viper_result)
+
+pheatmap(viper_result[top_tfs, ],
+         annotation_col = annotation_col,
+         scale = "row", 
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "euclidean",
+         fontsize_row = 8)
+```
+
+```{r}
+library(ggvenn)
+col_tfs <- rownames(master_regulators_collectri)
+llcb_tfs <- rownames(master_regulators)
+do_tfs <- rownames(master_regulators_do)
+
+venn_list <- list(
+  LLCB = llcb_tfs,
+  DoRothEA = do_tfs,
+  CollecTRI = col_tfs
+)
+
+ggvenn(venn_list,
+       fill_color = c("#E69F00", "#56B4E9", "#009E73"),
+       stroke_size = 0.5, set_name_size = 12, text_size = 12)
+```
+
