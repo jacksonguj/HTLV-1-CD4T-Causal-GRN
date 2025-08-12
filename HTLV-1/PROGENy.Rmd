@@ -1,0 +1,38 @@
+---
+title: "progeny"
+output: html_document
+---
+
+```{r}
+library(progeny)
+
+exprs_progeny <- as.matrix(exprs_viper)
+
+progeny_scores <- progeny(exprs_progeny, scale = TRUE, organism = "Human", top = 100)
+progeny_scores <- t(progeny_scores)
+
+library(limma)
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(progeny_scores, design)
+contrast <- makeContrasts(ATLVsNI = ATL - NI, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+top_progeny <- topTable(fit2, number = Inf)
+head(top_progeny)
+
+```
+
+```{r}
+pheatmap(progeny_scores,
+         annotation_col = annotation_col,
+         scale = "row",  
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         fontsize_row = 10,
+         fontsize_col = 8)
+```
+
