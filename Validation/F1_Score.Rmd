@@ -1,0 +1,269 @@
+---
+title: "F1score"
+output: html_document
+---
+
+# library
+```{r}
+library(readxl)
+library(dplyr)
+library(pROC)
+library(PRROC)
+library(ggplot2)
+library(transport)
+library(readr)
+```
+
+```{r}
+causal_network <- read_excel("/Users/jihungu/Desktop/Thesis/RNAseq-perturbation-CD4-pipeline-master/causal_network.xlsx")
+```
+
+# 210 edges from causal network
+```{r}
+causal_network_20 <- causal_network %>%
+  dplyr::filter(abs(estimate) >= 0.020) 
+causal_network_25 <- causal_network %>%
+  dplyr::filter(abs(estimate) >= 0.025)
+causal_network_30 <- causal_network %>%
+  dplyr::filter(abs(estimate) >= 0.03)
+```
+
+# LASSO edges
+```{r}
+lasso <- read_csv("/Users/jihungu/Desktop/Thesis/LASSO/lasso_causal_edges_84.csv")
+```
+
+
+```{r}
+lasso <- lasso %>%
+  dplyr::filter(abs(Weight) >= 0.015)
+lasso <- lasso  %>%
+  dplyr::rename(row = Source, col = Target, estimate = Weight)
+```
+
+# dcdi-g edges
+```{r}
+dcdig <- readr::read_csv("/Users/jihungu/Desktop/Thesis/DCDI/dcdi_g_edges_84x13000.csv") %>%
+  dplyr::rename(row = Source, col = Target, estimate = Weight)
+dcdig <- dcdig %>%
+  dplyr::filter(row %in% perturb_genes & col %in% perturb_genes)
+```
+
+# dcdi-dsf edges
+```{r}
+dcdidsf <- readr::read_csv("/Users/jihungu/Desktop/Thesis/DCDI/dcdi_dsf_edges_84x13000.csv") %>%
+  dplyr::rename(row = Source, col = Target, estimate = Weight)
+dcdidsf <- dcdidsf %>%
+  dplyr::filter(row %in% perturb_genes & col %in% perturb_genes)
+```
+
+# gies edges
+```{r}
+gies <- readr::read_csv("/Users/jihungu/Desktop/Thesis/causalbench-master/CD4_inffered_network/GIES_network.csv") %>%
+  dplyr::rename(row = source, col = target)
+gies <- gies %>%
+  dplyr::filter(row %in% perturb_genes & col %in% perturb_genes)
+```
+
+```{r}
+# load data
+perturb_genes <- read_tsv("/Users/jihungu/Desktop/Thesis/LASSO/Perturbations.tsv", col_names = FALSE) %>%
+  pull(1) %>% unique()
+
+# extract edges between the genes
+perturb_edges <- reactome_edges %>%
+  dplyr::filter(ensembl1 %in% perturb_genes & ensembl2 %in% perturb_genes) %>%
+  dplyr::select(ensembl1, ensembl2)
+```
+
+```{r}
+# delete duplicate rows
+perturb_edges <- perturb_edges %>%
+  dplyr::filter(ensembl1 != ensembl2)
+
+perturb_edges <- perturb_edges %>%
+  dplyr::distinct()
+```
+
+###
+
+# reactome FIs
+```{r}
+FIs_24 <- read.delim("/Users/jihungu/Desktop/Thesis/Ground Truth/Reactome/FIs_2024.txt", header = TRUE, sep = "\t")
+```
+
+```{r}
+# extract edges between the genes
+FIs_24 <- FIs_24 %>%
+  dplyr::filter(Gene1 %in% perturb_genes & Gene2 %in% perturb_genes)
+```
+
+# TRRUST
+```{r}
+trrust <- read.delim("/Users/jihungu/Desktop/Thesis/Ground Truth/TTRUST/trrust_rawdata.human.tsv", header = FALSE, sep = "\t")
+trrust <- trrust %>%
+  dplyr::filter(V1 %in% perturb_genes & V2 %in% perturb_genes)
+```
+
+# HumanBase
+```{r}
+HBase <- read_excel("/Users/jihungu/Desktop/Thesis/Ground Truth/hbase_reactome.xlsx") %>%
+  dplyr::filter(Gene1 %in% perturb_genes & Gene2 %in% perturb_genes)
+```
+
+# check matched edges
+```{r}
+# edges regardless direction
+causal_edges <- gies %>%
+  mutate(edge = paste0(pmin(row, col), "_", pmax(row, col))) %>%
+  distinct(edge)
+
+fis_edges <- FIs_24 %>%
+  mutate(edge = paste0(pmin(Gene1, Gene2), "_", pmax(Gene1, Gene2))) %>%
+  distinct(edge)
+
+hbase_edges <- HBase %>%
+  mutate(edge = paste0(pmin(Gene1, Gene2), "_", pmax(Gene1, Gene2))) %>%
+  distinct(edge)
+```
+
+```{r}
+# number of shared edges
+shared_edges <- intersect(causal_edges$edge, hbase_edges$edge)
+length(shared_edges)
+```
+
+```{r}
+TP <- sum(causal_edges$edge %in% hbase_edges$edge)
+
+FP <- sum(!(causal_edges$edge %in% hbase_edges$edge))
+
+FN <- sum(!(hbase_edges$edge %in% causal_edges$edge))
+
+# Precision, Recall, F1
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1 <- 2 * precision * recall / (precision + recall)
+
+cat("TP:", TP, "\n")
+cat("FP:", FP, "\n")
+cat("FN:", FN, "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(f1, 3), "\n")
+```
+
+# trrust + reactome LLCB F1
+```{r}
+trrust_edges <- trrust %>%
+  mutate(edge = paste0(pmin(V1, V2), "_", pmax(V1, V2))) %>%
+  distinct(edge)
+all_gt_edges <- bind_rows(fis_edges, trrust_edges) %>%
+  distinct(edge)
+
+total_possible_edges <- 3486
+
+TP <- sum(causal_edges$edge %in% all_gt_edges$edge)
+FP <- sum(!(causal_edges$edge %in% all_gt_edges$edge))
+FN <- sum(!(all_gt_edges$edge %in% causal_edges$edge))
+TN <- total_possible_edges - (TP + FP + FN)
+
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1 <- 2 * precision * recall / (precision + recall)
+
+cat("TP:", TP, "\n")
+cat("FP:", FP, "\n")
+cat("FN:", FN, "\n")
+cat("TN:", TN, "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(f1, 3), "\n")
+```
+
+# LASSO F1
+```{r}
+total_possible_edges <- 3486
+
+TP_lasso <- sum(lasso_edges$edge %in% all_gt_edges$edge)
+FP_lasso <- sum(!(lasso_edges$edge %in% all_gt_edges$edge))
+FN_lasso <- sum(!(all_gt_edges$edge %in% lasso_edges$edge))
+TN_lasso <- total_possible_edges - (TP_lasso + FP_lasso + FN_lasso)
+
+precision_lasso <- TP_lasso / (TP_lasso + FP_lasso)
+recall_lasso <- TP_lasso / (TP_lasso + FN_lasso)
+f1_lasso <- 2 * precision_lasso * recall_lasso / (precision_lasso + recall_lasso)
+
+cat("TP:", TP_lasso, "\n")
+cat("FP:", FP_lasso, "\n")
+cat("FN:", FN_lasso, "\n")
+cat("TN:", TN_lasso, "\n")
+cat("Precision:", round(precision_lasso, 3), "\n")
+cat("Recall:", round(recall_lasso, 3), "\n")
+cat("F1 Score:", round(f1_lasso, 3), "\n")
+```
+
+
+```{r}
+library(dplyr)
+causal_edges <- causal_network_25 %>%
+  mutate(edge = paste0(pmin(row, col), "_", pmax(row, col))) %>%
+  mutate(score = estimate) %>%
+  mutate(label = ifelse(edge %in% all_gt_edges$edge, 1, 0))
+```
+
+# AUROC, AUPRC 
+```{r}
+roc_obj <- roc(response = causal_edges$label, predictor = causal_edges$score)
+auroc <- auc(roc_obj)
+
+pr_obj <- pr.curve(scores.class0 = causal_edges$score[causal_edges$label == 1],
+                   scores.class1 = causal_edges$score[causal_edges$label == 0],
+                   curve = TRUE)
+auprc <- pr_obj$auc.integral
+
+cat("AUROC:", round(auroc, 3), "\n")
+cat("AUPRC:", round(auprc, 3), "\n")
+```
+
+# ROC Curve
+```{r}
+roc_obj <- roc(response = causal_edges$label, predictor = causal_edges$score)
+
+roc_df <- data.frame(
+  fpr = rev(1 - roc_obj$specificities),
+  tpr = rev(roc_obj$sensitivities)
+)
+
+# ROC plot
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = paste("ROC Curve (AUROC =", round(auc(roc_obj), 3), ")"),
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal()
+
+```
+
+```{r}
+pr <- pr.curve(scores.class0 = causal_edges$score[causal_edges$label == 1],
+               scores.class1 = causal_edges$score[causal_edges$label == 0],
+               curve = TRUE)
+
+pr_df <- data.frame(
+  recall = pr$curve[, 1],
+  precision = pr$curve[, 2]
+)
+
+# PR Curve plot
+ggplot(pr_df, aes(x = recall, y = precision)) +
+  geom_line(color = "darkorange", size = 1.2) +
+  labs(title = paste("Precision-Recall Curve (AUPRC =", round(pr$auc.integral, 3), ")"),
+       x = "Recall",
+       y = "Precision") +
+  theme_minimal()
+
+```
+
+
