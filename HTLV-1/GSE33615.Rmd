@@ -1,0 +1,374 @@
+---
+title: "GSE33615"
+output: html_document
+---
+
+# library
+```{r}
+library(GEOquery)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(dplyr)
+library(enrichplot)
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+
+# Data preparation
+```{r}
+# GEO ID
+geo_id <- "GSE33615"
+
+# data download
+gse <- getGEO(geo_id, GSEMatrix = TRUE)
+```
+
+```{r}
+exprSet <- gse[[1]]
+
+# (expression values)
+exprs_data <- exprs(exprSet)
+
+# metatdata
+pheno_data <- pData(exprSet)
+
+# annotation (probe information)
+feature_data <- fData(exprSet)
+
+# ATL vs Control
+source_labels <- trimws(as.character(pheno_data$source_name_ch1))
+
+group <- factor(ifelse(grepl("^ATL", source_labels), "ATL", "NI"))
+```
+
+
+```{r}
+# Acute Chronic Uninfected
+title_labels <- trimws(as.character(pheno_data$characteristics_ch1.1))
+
+group <- case_when(
+  grepl("Acute", title_labels) ~ "Acute",
+  grepl("Chronic", title_labels) ~ "Chronic",
+  grepl("uninfected", title_labels) ~ "Control",
+  TRUE ~ "Other"
+)
+
+group <- factor(group)
+table(group)
+#
+```
+
+```{r}
+annot <- gse[[1]]@featureData@data
+```
+
+
+# Preprocessing Normalization
+```{r}
+
+
+# normalizeBetweenArrays
+norm_exprs_data <- normalizeBetweenArrays(exprs_data, method = "quantile")
+
+# Log2
+norm_exprs_data <- log2(norm_exprs_data) 
+
+# boxplot before vs after
+boxplot(exprs_data[, 1:73], main = "Before Normalization", las = 2)
+boxplot(norm_exprs_data[, 1:73], main = "After Normalization", las = 2)
+```
+
+```{r}
+# Select ATL Control
+selected_idx <- group %in% c("NI", "ATL")
+
+exprs_filtered <- norm_exprs_data[, selected_idx]
+group_filtered <- droplevels(group[selected_idx])
+
+t_expr <- t(exprs_filtered)
+
+# perform PCA
+pca_res <- prcomp(t_expr, center = TRUE, scale. = TRUE)
+
+# result frame
+pca_df <- as.data.frame(pca_res$x[, 1:2])  # PC1, PC2
+pca_df$Group <- group_filtered
+
+# visualization
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "ATL vs Control", x = "PC1", y = "PC2") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+t_expr_all <- t(norm_exprs_data)
+group_all <- group  
+
+pca_res_all <- prcomp(t_expr_all, center = TRUE, scale. = TRUE)
+
+pca_df_all <- as.data.frame(pca_res_all$x[, 1:2])
+pca_df_all$Group <- group_all
+
+ggplot(pca_df_all, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of All Groups", x = "PC1", y = "PC2") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+# DEG (lo2fc 1.5, adjusted p-value 0.05)
+```{r}
+# design
+design <- model.matrix(~0 + group)  # delete intercept
+colnames(design) <- levels(group)   #
+
+# linear model fitting
+fit <- lmFit(norm_exprs_data, design)
+
+# contrast (ATL vs Control)
+contrast_matrix <- makeContrasts(ATLvsNI = ATL - NI, levels = design)
+
+# apply contrast & eBayes
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# substract DEG
+deg_results <- topTable(fit2, coef = "ATLvsNI", adjust = "BH", number = Inf)
+deg_results <- deg_results %>% rownames_to_column(var = "ID")
+deg_results$ID <- as.character(deg_results$ID)
+annot$ID <- as.character(annot$ID)
+deg_results <- left_join(deg_results, annot, by = "ID")
+deg_results <- dplyr::select(deg_results, GENE_SYMBOL, everything())
+
+# delete NA in GENE_SYMBOL
+deg_results <- deg_results %>%
+  filter(!is.na(GENE_SYMBOL) & GENE_SYMBOL != "")
+```
+
+
+```{r}
+# logFC probe
+deg_results <- deg_results %>%
+  group_by(GENE_SYMBOL) %>%
+  slice_max(order_by = abs(logFC), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# filtering: |log2FC| > 1.5, adj.P.Val < 0.05
+deg_signif <- deg_results %>%
+  dplyr::filter(abs(logFC) > 1.5, adj.P.Val < 0.05)
+```
+
+# Volcano plot
+```{r}
+# Up: 800 Down 770
+deg_results$threshold <- with(deg_results, ifelse(adj.P.Val < 0.05 & abs(logFC) > 1.5,
+                                                  ifelse(logFC > 1.5, "Up", "Down"), "NS"))
+
+ggplot(deg_results, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "grey")) +
+  theme_minimal() +
+  labs(title = "ATL vs Control",
+       x = "log2 Fold Change", y = "-log10 Adjusted P-value")
+```
+
+# 3. GSEA analysis of DEG of GSE33615 reactome analysis / KEGG analysis
+Gene Set Enrichment Analysis (logFC)
+Pathway
+```{r}
+# logFC
+gene_list <- deg_results$logFC
+names(gene_list) <- deg_results$GENE_SYMBOL
+gene_list <- sort(gene_list, decreasing = TRUE)
+symbol2entrez <- bitr(names(gene_list), fromType = "SYMBOL",
+                      toType = "ENTREZID",
+                      OrgDb = org.Hs.eg.db)
+
+# geneList (ENTREZID)
+gene_list_entrez <- gene_list[symbol2entrez$SYMBOL]
+names(gene_list_entrez) <- symbol2entrez$ENTREZID
+gene_list_entrez <- sort(gene_list_entrez, decreasing = TRUE)
+
+```
+
+# KEGG
+```{r}
+gsea_kegg <- gseKEGG(geneList = gene_list_entrez,
+                     organism = "hsa",
+                     pvalueCutoff = 0.05,
+                     verbose = FALSE)
+dotplot(gsea_kegg, showCategory = 20)
+```
+
+# GO Biological Process
+```{r}
+gsea_go <- gseGO(geneList = gene_list_entrez,
+                 OrgDb = org.Hs.eg.db,
+                 ont = "BP",
+                 keyType = "ENTREZID",
+                 pvalueCutoff = 0.05,
+                 verbose = FALSE)
+dotplot(gsea_go, showCategory = 20)
+```
+
+# Reactome
+```{r}
+gsea_reactome <- gsePathway(geneList = gene_list_entrez,
+                            organism = "human",
+                            pvalueCutoff = 0.05,
+                            verbose = FALSE)
+dotplot(gsea_reactome, showCategory = 20)
+
+```
+
+# ORA (Over-Representation Analysis)
+Whether DEG is concentrated in specific pathways
+KEGG: gene - pathway - disease
+Reactome: modeling specific molecule flow of biological reaction in cell
+
+# KEGG ORA
+```{r}
+# extract DEG lists
+deg_genes <- deg_results %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1.5) %>%
+  filter(!is.na(GENE_SYMBOL) & GENE_SYMBOL != "")
+
+# SYMBOL → ENTREZID
+deg_entrez <- bitr(deg_genes$GENE_SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# enrichKEGG
+enrich_kegg <- enrichKEGG(gene = deg_entrez$ENTREZID,
+                          organism = "hsa",
+                          pvalueCutoff = 0.05)
+
+dotplot(enrich_kegg, showCategory = 30)
+
+```
+
+# Reactome ORA
+```{r}
+enrich_reactome <- enrichPathway(gene = deg_entrez$ENTREZID,
+                                 organism = "human",
+                                 pvalueCutoff = 0.05,
+                                 readable = TRUE)
+
+# Visualization
+dotplot(enrich_reactome, showCategory = 23)
+```
+
+# JAK-STAT signaling pathway genes
+```{r}
+# result table
+enrich_res <- enrich_kegg@result
+
+# JAK-STAT pathway
+jak_row <- enrich_res[grep("JAK-STAT signaling pathway", enrich_res$Description), ]
+
+# gene list ENTREZ to SYMBOL
+jak_genes <- strsplit(jak_row$geneID, "/")[[1]]
+
+jak_gene_symbols <- bitr(jak_genes,
+                         fromType = "ENTREZID",
+                         toType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db)
+
+jak_gene_symbols$SYMBOL
+```
+
+```{r}
+# Cytokine-cytokine receptor
+cyto_row <- enrich_res[grep("Cytokine-cytokine receptor", enrich_res$Description), ]
+
+# gene list ENTREZ to SYMBOL
+cyto_genes <- strsplit(cyto_row$geneID, "/")[[1]]
+
+cyto_gene_symbols <- bitr(cyto_genes,
+                         fromType = "ENTREZID",
+                         toType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db)
+
+cyto_gene_symbols$SYMBOL
+```
+
+```{r}
+intersect_genes <- intersect(jak_gene_symbols$SYMBOL, cyto_gene_symbols$SYMBOL)
+intersect_genes
+```
+
+```{r}
+stat_genes <- c("MLL", "STAT1", "STAT3", "STAT5A", "STAT5B", "IRF4", "JAK3", "IL2RA", "MYB")
+
+stat_probes <- feature_data %>%
+  filter(GENE_SYMBOL %in% stat_genes) %>%
+  dplyr::select(ID, GENE_SYMBOL)
+
+stat_exprs <- exprs_data[rownames(exprs_data) %in% stat_probes$ID, ]
+
+rownames(stat_exprs) <- stat_probes$GENE_SYMBOL[match(rownames(stat_exprs), stat_probes$ID)]
+
+```
+
+```{r}
+library(reshape2)
+stat_exprs_df <- as.data.frame(stat_exprs)
+stat_exprs_df$GENE <- rownames(stat_exprs_df)
+long_df <- melt(stat_exprs_df, id.vars = "GENE", variable.name = "Sample", value.name = "Expression")
+
+long_df$Group <- group[match(long_df$Sample, colnames(exprs_data))]
+
+# ggplot boxplot
+library(ggplot2)
+ggplot(long_df, aes(x = Group, y = Expression, fill = Group)) +
+  geom_boxplot() +
+  facet_wrap(~GENE, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "STAT Genes Expression: ATL vs Control")
+
+long_df %>%
+  group_by(GENE) %>%
+  summarise(p_value = wilcox.test(Expression ~ Group)$p.value)
+```
+
+```{r}
+stat_genes <- c("MLL", "STAT1", "STAT3", "STAT5A", "STAT5B", "IRF4", "JAK3", "IL2RA")
+
+stat_probes <- feature_data %>%
+  filter(GENE_SYMBOL %in% stat_genes) %>%
+  dplyr::select(ID, GENE_SYMBOL)
+
+stat_exprs <- exprs_data[rownames(exprs_data) %in% stat_probes$ID, ]
+
+rownames(stat_exprs) <- stat_probes$GENE_SYMBOL[match(rownames(stat_exprs), stat_probes$ID)]
+
+```
+
+```{r}
+library(reshape2)
+stat_exprs_df <- as.data.frame(stat_exprs)
+stat_exprs_df$GENE <- rownames(stat_exprs_df)
+long_df <- melt(stat_exprs_df, id.vars = "GENE", variable.name = "Sample", value.name = "Expression")
+
+long_df$Group <- group[match(long_df$Sample, colnames(exprs_data))]
+
+# ggplot boxplot
+library(ggplot2)
+ggplot(long_df, aes(x = Group, y = Expression, fill = Group)) +
+  geom_boxplot() +
+  facet_wrap(~GENE, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "STAT Genes Expression: ATL vs Control")
+
+long_df %>%
+  group_by(GENE) %>%
+  summarise(p_value = wilcox.test(Expression ~ Group)$p.value)
+```
